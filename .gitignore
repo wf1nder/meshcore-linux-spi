@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+*.deb
+debroot/
+.DS_Store
+meshcore_rfm95_companion.remote.py
+sx1276_radio.remote.py

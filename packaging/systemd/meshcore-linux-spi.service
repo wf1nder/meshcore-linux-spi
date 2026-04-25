@@ -1,0 +1,15 @@
+[Unit]
+Description=MeshCore Linux SPI companion
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/meshcore-linux-spi
+WorkingDirectory=/opt/meshcore-linux-spi
+ExecStart=/opt/meshcore-linux-spi/venv/bin/meshcore-linux-spi
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
