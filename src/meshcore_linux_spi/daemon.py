@@ -60,6 +60,14 @@ ALLOWED_RADIO_PROFILES = {
 }
 
 
+def _periodic_advert_interval_sec() -> int:
+    try:
+        return max(0, int(os.getenv("MESHCORE_ADVERT_INTERVAL_SEC", "43200")))
+    except ValueError:
+        logging.warning("Bad MESHCORE_ADVERT_INTERVAL_SEC value; using 43200")
+        return 43200
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
@@ -554,10 +562,19 @@ async def main():
         identity.get_public_key().hex(),
         DB_FILE,
     )
+    advert_interval_sec = _periodic_advert_interval_sec()
+    if advert_interval_sec:
+        logging.info("Periodic flood adverts enabled: every %s seconds", advert_interval_sec)
+    else:
+        logging.info("Periodic flood adverts disabled")
+
     try:
-        while True:
+        if advert_interval_sec:
             await companion.advertise(flood=True)
-            await asyncio.sleep(300)
+        while True:
+            await asyncio.sleep(advert_interval_sec or 3600)
+            if advert_interval_sec:
+                await companion.advertise(flood=True)
     finally:
         await server.stop()
         await companion.stop()

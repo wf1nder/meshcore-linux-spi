@@ -22,5 +22,8 @@ MESHCORE_SYNC_WORD=0x12
 MESHCORE_NODE_NAME=meshcore-linux-spi
 LOG_LEVEL=INFO
 
+# Periodic flood advert interval, in seconds. 43200 = 12 hours, 0 = disabled.
+MESHCORE_ADVERT_INTERVAL_SEC=43200
+
 # Experimental only. Stock mobile clients may not authenticate this way.
 # MESHCORE_PASSWORD=
