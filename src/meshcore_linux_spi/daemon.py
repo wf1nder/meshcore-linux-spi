@@ -377,6 +377,10 @@ class PersistentFrameServer(CompanionFrameServer):
         self.device_pin = int(os.getenv("MESHCORE_PIN", "0") or "0")
         super().__init__(*args, **kwargs)
 
+    def _setup_push_callbacks(self) -> None:
+        super()._setup_push_callbacks()
+        self.bridge.on_rx_log_data(self.push_rx_raw)
+
     async def _persist_companion_message(self, msg_dict: dict) -> None:
         self.state.add_message(msg_dict)
 
