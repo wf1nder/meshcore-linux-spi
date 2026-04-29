@@ -46,6 +46,14 @@ def radio_defaults() -> dict:
         "preamble_length": _env_int("MESHCORE_PREAMBLE", 17),
         "sync_word": _env_int("MESHCORE_SYNC_WORD", 0x12),
         "poll_interval": float(os.getenv("MESHCORE_POLL_INTERVAL", "0.02")),
+        "lbt": _env_bool("MESHCORE_LBT", True),
+        "lbt_max_attempts": _env_int("MESHCORE_LBT_MAX_ATTEMPTS", 20),
+        "lbt_retry_delay": float(os.getenv("MESHCORE_LBT_RETRY_DELAY", "0.2")),
+        "lbt_max_wait": float(os.getenv("MESHCORE_LBT_MAX_WAIT", "4")),
+        "tx_airtime_factor": float(os.getenv("MESHCORE_TX_AIRTIME_FACTOR", "1")),
+        "flood_tx_delay_factor": float(os.getenv("MESHCORE_FLOOD_TX_DELAY_FACTOR", "0.5")),
+        "direct_tx_delay_factor": float(os.getenv("MESHCORE_DIRECT_TX_DELAY_FACTOR", "0.2")),
+        "tx_min_interval": float(os.getenv("MESHCORE_TX_MIN_INTERVAL", "0")),
     }
 
 

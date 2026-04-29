@@ -458,6 +458,23 @@ class PersistentFrameServer(CompanionFrameServer):
         await super()._cmd_set_flood_scope(data)
         self.state.save_flood_scope(getattr(self.bridge, "_flood_transport_key", None))
 
+    async def _cmd_send_channel_txt_msg(self, data: bytes) -> None:
+        if len(data) >= 6:
+            txt_type = data[0]
+            channel_idx = data[1]
+            text = data[6:].decode("utf-8", errors="replace").rstrip("\x00")
+            channel = self.bridge.get_channel(channel_idx)
+            channel_name = getattr(channel, "name", None) if channel is not None else None
+            logging.info(
+                "Client channel send: channel=%s name=%r type=%d chars=%d",
+                channel_idx,
+                channel_name,
+                txt_type,
+                len(text),
+            )
+            logging.debug("Client channel send text: %r", text)
+        await super()._cmd_send_channel_txt_msg(data)
+
     async def _cmd_import_contact(self, data: bytes) -> None:
         await super()._cmd_import_contact(data)
         await self._save_contacts()

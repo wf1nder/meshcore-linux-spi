@@ -18,6 +18,13 @@ MESHCORE_CR=8
 MESHCORE_TX_POWER=17
 MESHCORE_SYNC_WORD=0x12
 
+# TX pacing. Defaults match MeshCore-style random txdelay plus airtime guard.
+# For EU 10% duty-cycle style operation, use MESHCORE_TX_AIRTIME_FACTOR=9.
+# MESHCORE_TX_AIRTIME_FACTOR=1
+# MESHCORE_FLOOD_TX_DELAY_FACTOR=0.5
+# MESHCORE_DIRECT_TX_DELAY_FACTOR=0.2
+# MESHCORE_LBT=true
+
 # Node metadata.
 MESHCORE_NODE_NAME=meshcore-linux-spi
 LOG_LEVEL=INFO
