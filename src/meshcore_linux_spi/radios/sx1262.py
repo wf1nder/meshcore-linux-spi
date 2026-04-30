@@ -89,6 +89,20 @@ class SX1262Radio(LoRaRadio):
             rxen=self.rxen_pin,
         ):
             return False
+        self._configure_lora()
+        self._initialized = True
+        self._ensure_rx_task()
+        logger.info(
+            "SX1262 initialized on SPI bus=%s cs=%s reset=%s busy=%s irq=%s",
+            self.bus_id,
+            self.cs_id,
+            self.reset_pin,
+            self.busy_pin,
+            self.irq_pin,
+        )
+        return True
+
+    def _configure_lora(self):
         if self.dio2_rf_switch:
             self.lora.setDio2RfSwitch(True)
         self.configure_radio(
@@ -106,16 +120,25 @@ class SX1262Radio(LoRaRadio):
             False,
         )
         self._request_rx()
+
+    def _recover_radio(self, reason: str) -> bool:
+        logger.warning("Resetting SX1262 radio after %s", reason)
+        self._initialized = False
+        try:
+            self.lora.reset()
+            self.lora.setStandby(self.lora.STANDBY_RC)
+            if self.lora.getMode() != self.lora.STATUS_MODE_STDBY_RC:
+                raise RuntimeError("SX1262 did not enter standby after reset")
+            self.lora.setPacketType(self.lora.LORA_MODEM)
+            if hasattr(self.lora, "_fixResistanceAntenna"):
+                self.lora._fixResistanceAntenna()
+            self._configure_lora()
+        except Exception:
+            logger.exception("SX1262 radio recovery failed")
+            return False
         self._initialized = True
         self._ensure_rx_task()
-        logger.info(
-            "SX1262 initialized on SPI bus=%s cs=%s reset=%s busy=%s irq=%s",
-            self.bus_id,
-            self.cs_id,
-            self.reset_pin,
-            self.busy_pin,
-            self.irq_pin,
-        )
+        logger.info("SX1262 radio recovered")
         return True
 
     def set_rx_callback(self, callback):
@@ -162,13 +185,21 @@ class SX1262Radio(LoRaRadio):
                 elif status == self.lora.STATUS_HEADER_ERR:
                     logger.debug("RX header error")
                 await asyncio.sleep(self.poll_interval)
-            except Exception:
-                logger.exception("RX loop error")
+            except Exception as exc:
+                logger.exception("RX loop error; resetting radio")
+                self._recover_radio(f"RX loop error: {exc}")
                 await asyncio.sleep(1)
 
     async def send(self, data: bytes):
         if not self._initialized and not self.begin():
             raise RuntimeError("SX1262 init failed")
+        try:
+            return await self._send_once(data)
+        except Exception as exc:
+            self._recover_radio(f"TX error: {exc}")
+            raise
+
+    async def _send_once(self, data: bytes):
         async with self._tx_lock:
             if data:
                 header = data[0]
@@ -274,10 +305,9 @@ class SX1262Radio(LoRaRadio):
                             busy_checks,
                         )
                     return
-            except Exception:
-                logger.exception("CAD check failed; transmitting without LBT")
-                self._request_rx()
-                return
+            except Exception as exc:
+                logger.exception("CAD check failed")
+                raise RuntimeError("CAD check failed") from exc
 
             busy_checks += 1
             if attempt == max_attempts - 1 or time.monotonic() - started >= self.lbt_max_wait:
