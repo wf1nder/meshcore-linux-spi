@@ -39,6 +39,7 @@ class SX1262Radio(LoRaRadio):
         flood_tx_delay_factor=0.5,
         direct_tx_delay_factor=0.2,
         tx_min_interval=0.0,
+        use_dio_irq=False,
         **_,
     ):
         self.bus_id = bus_id
@@ -66,25 +67,29 @@ class SX1262Radio(LoRaRadio):
         self.flood_tx_delay_factor = float(flood_tx_delay_factor)
         self.direct_tx_delay_factor = float(direct_tx_delay_factor)
         self.tx_min_interval = float(tx_min_interval)
+        self.use_dio_irq = bool(use_dio_irq)
         self.lora = SX126x()
         self.rx_callback = None
         self._rx_task = None
         self._initialized = False
         self._tx_lock = asyncio.Lock()
+        self._tx_active = False
         self._last_tx_at = 0.0
         self._next_tx_at = 0.0
         self._last_rssi = 0
         self._last_snr = 0.0
+        self._last_health_check_at = 0.0
 
     def begin(self):
         if self._initialized:
             return True
+        irq_pin = self.irq_pin if self.use_dio_irq else -1
         if not self.lora.begin(
             bus=self.bus_id,
             cs=self.cs_id,
             reset=self.reset_pin,
             busy=self.busy_pin,
-            irq=self.irq_pin,
+            irq=irq_pin,
             txen=self.txen_pin,
             rxen=self.rxen_pin,
         ):
@@ -93,12 +98,13 @@ class SX1262Radio(LoRaRadio):
         self._initialized = True
         self._ensure_rx_task()
         logger.info(
-            "SX1262 initialized on SPI bus=%s cs=%s reset=%s busy=%s irq=%s",
+            "SX1262 initialized on SPI bus=%s cs=%s reset=%s busy=%s irq=%s mode=%s",
             self.bus_id,
             self.cs_id,
             self.reset_pin,
             self.busy_pin,
             self.irq_pin,
+            "gpio" if self.use_dio_irq else "spi-poll",
         )
         return True
 
@@ -158,32 +164,27 @@ class SX1262Radio(LoRaRadio):
     async def _rx_loop(self):
         while self._initialized:
             try:
-                if not self.lora.available():
+                if self._tx_active:
                     await asyncio.sleep(self.poll_interval)
                     continue
-
-                status = self.lora.status()
-                if status == self.lora.STATUS_RX_DONE:
-                    length = self.lora.available()
-                    data = bytes(self.lora.read(length)) if length else b""
-                    self._last_rssi = int(self.lora.packetRssi())
-                    self._last_snr = float(self.lora.snr())
-                    if data and self.rx_callback:
-                        header = data[0]
-                        logger.info(
-                            "RX raw len=%d route=%d type=0x%02x rssi=%d snr=%.1f data=%s",
-                            len(data),
-                            header & 0x03,
-                            (header >> 2) & 0x0F,
-                            self._last_rssi,
-                            self._last_snr,
-                            data[:16].hex(),
-                        )
-                        self.rx_callback(data, self._last_rssi, self._last_snr)
-                elif status == self.lora.STATUS_CRC_ERR:
-                    logger.debug("RX CRC error")
-                elif status == self.lora.STATUS_HEADER_ERR:
-                    logger.debug("RX header error")
+                self._check_receive_mode()
+                packet = self._poll_rx_packet()
+                if packet:
+                    data, rssi, snr = packet
+                    self._last_rssi = rssi
+                    self._last_snr = snr
+                    header = data[0]
+                    logger.info(
+                        "RX raw len=%d route=%d type=0x%02x rssi=%d snr=%.1f data=%s",
+                        len(data),
+                        header & 0x03,
+                        (header >> 2) & 0x0F,
+                        rssi,
+                        snr,
+                        data[:16].hex(),
+                    )
+                    if self.rx_callback:
+                        self.rx_callback(data, rssi, snr)
                 await asyncio.sleep(self.poll_interval)
             except Exception as exc:
                 logger.exception("RX loop error; resetting radio")
@@ -212,24 +213,83 @@ class SX1262Radio(LoRaRadio):
                 )
             estimated_airtime_ms = self._estimate_airtime_ms(len(data))
             await self._wait_for_tx_pacing(data, estimated_airtime_ms)
-            if self.lbt:
-                await self._wait_for_clear_channel()
-            self.lora.beginPacket()
-            self.lora.write(tuple(data), len(data))
-            ok = self.lora.endPacket()
-            if ok:
-                deadline = time.monotonic() + 5.0
-                while not self.lora._statusIrq and time.monotonic() < deadline:
-                    await asyncio.sleep(self.poll_interval)
-                ok = self.lora.status() == self.lora.STATUS_TX_DONE
-            actual_airtime_ms = self._safe_airtime_ms(self.lora.transmitTime(), estimated_airtime_ms)
-            self._request_rx()
-            self._last_tx_at = time.monotonic()
-            self._schedule_next_tx(actual_airtime_ms)
-            return {"success": bool(ok), "airtime_ms": actual_airtime_ms}
+            self._tx_active = True
+            try:
+                if self.lbt:
+                    await self._wait_for_clear_channel()
+                self.lora.beginPacket()
+                self.lora.write(tuple(data), len(data))
+                tx_started = time.monotonic()
+                ok = self.lora.endPacket()
+                if ok:
+                    ok = await self._wait_for_tx_done(estimated_airtime_ms)
+                actual_airtime_ms = self._safe_airtime_ms(
+                    (time.monotonic() - tx_started) * 1000 if ok else 0,
+                    estimated_airtime_ms,
+                )
+                self._request_rx()
+                self._last_tx_at = time.monotonic()
+                self._schedule_next_tx(actual_airtime_ms)
+                return {"success": bool(ok), "airtime_ms": actual_airtime_ms}
+            finally:
+                self._tx_active = False
 
     def _request_rx(self):
         self.lora.request(self.lora.RX_CONTINUOUS)
+
+    def _poll_rx_packet(self):
+        irq = self.lora.getIrqStatus()
+        if not irq:
+            return None
+
+        self.lora.clearIrqStatus(0x03FF)
+
+        if irq & self.lora.IRQ_CRC_ERR:
+            logger.debug("RX CRC error")
+            return None
+        if irq & self.lora.IRQ_HEADER_ERR:
+            logger.debug("RX header error")
+            return None
+        if not (irq & self.lora.IRQ_RX_DONE):
+            return None
+
+        length, offset = self.lora.getRxBufferStatus()
+        if length <= 0:
+            return None
+        data = bytes(self.lora.readBuffer(offset, length))
+        rssi = int(self.lora.packetRssi())
+        snr = float(self.lora.snr())
+        if self._looks_like_spi_garbage(data, rssi, snr):
+            raise RuntimeError(f"RX returned SPI garbage len={len(data)} byte=0x{data[0]:02x}")
+        return data, rssi, snr
+
+    def _looks_like_spi_garbage(self, data: bytes, rssi: int, snr: float) -> bool:
+        return bool(data) and len(data) > 8 and len(set(data)) == 1 and rssi == 0 and snr == 0
+
+    async def _wait_for_tx_done(self, estimated_airtime_ms: float) -> bool:
+        deadline = time.monotonic() + min(max(estimated_airtime_ms / 1000.0 * 3.0, 1.0), 5.0)
+        while time.monotonic() < deadline:
+            irq = self.lora.getIrqStatus()
+            if irq:
+                self.lora.clearIrqStatus(0x03FF)
+            if irq & self.lora.IRQ_TX_DONE:
+                return True
+            if irq & self.lora.IRQ_TIMEOUT:
+                logger.warning("SX1262 TX timeout IRQ")
+                return False
+            await asyncio.sleep(self.poll_interval)
+        logger.warning("SX1262 TX done not observed within %.1f ms", estimated_airtime_ms)
+        return False
+
+    def _check_receive_mode(self):
+        now = time.monotonic()
+        if now - self._last_health_check_at < 30.0:
+            return
+        self._last_health_check_at = now
+        mode = self.lora.getMode()
+        if mode != self.lora.STATUS_MODE_RX:
+            logger.warning("SX1262 left RX mode (mode=0x%02x); requesting RX", mode)
+            self._request_rx()
 
     async def _wait_for_tx_pacing(self, data: bytes, airtime_ms: float):
         delay = self._next_tx_at - time.monotonic()

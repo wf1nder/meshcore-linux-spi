@@ -90,6 +90,7 @@ def create_radio():
                 "dio2_rf_switch": _env_bool(
                     "MESHCORE_DIO2_RF_SWITCH", params.get("dio2_rf_switch", False)
                 ),
+                "use_dio_irq": _env_bool("MESHCORE_USE_DIO_IRQ", params.get("use_dio_irq", False)),
             }
         )
         return SX1262Radio(**params)

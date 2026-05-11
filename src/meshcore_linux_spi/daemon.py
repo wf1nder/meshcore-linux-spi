@@ -50,14 +50,39 @@ DEFAULT_RADIO = {
     "coding_rate": _RADIO_DEFAULTS["coding_rate"],
     "tx_power_dbm": _RADIO_DEFAULTS["tx_power"],
 }
-ALLOWED_RADIO_PROFILES = {
-    (
-        DEFAULT_RADIO["frequency_hz"],
-        DEFAULT_RADIO["bandwidth_hz"],
-        DEFAULT_RADIO["spreading_factor"],
-        DEFAULT_RADIO["coding_rate"],
+
+
+def _radio_config_from_prefs(prefs: NodePrefs) -> dict:
+    return {
+        "frequency": int(prefs.frequency_hz),
+        "frequency_hz": int(prefs.frequency_hz),
+        "bandwidth": int(prefs.bandwidth_hz),
+        "bandwidth_hz": int(prefs.bandwidth_hz),
+        "spreading_factor": int(prefs.spreading_factor),
+        "coding_rate": int(prefs.coding_rate),
+        "tx_power": int(prefs.tx_power_dbm),
+        "tx_power_dbm": int(prefs.tx_power_dbm),
+    }
+
+
+def _apply_radio_prefs_to_device(radio, prefs: NodePrefs) -> None:
+    logging.info(
+        "Applying radio prefs: freq=%s bw=%s sf=%s cr=%s tx_power=%s",
+        int(prefs.frequency_hz),
+        int(prefs.bandwidth_hz),
+        int(prefs.spreading_factor),
+        int(prefs.coding_rate),
+        int(prefs.tx_power_dbm),
     )
-}
+    if hasattr(radio, "configure_radio"):
+        radio.configure_radio(
+            frequency=int(prefs.frequency_hz),
+            bandwidth=int(prefs.bandwidth_hz),
+            spreading_factor=int(prefs.spreading_factor),
+            coding_rate=int(prefs.coding_rate),
+        )
+    if hasattr(radio, "set_tx_power"):
+        radio.set_tx_power(int(prefs.tx_power_dbm))
 
 
 def _periodic_advert_interval_sec() -> int:
@@ -145,16 +170,16 @@ class StateStore:
     def load_prefs(self) -> NodePrefs:
         data = self.get_json("prefs", {})
         prefs = NodePrefs()
+        prefs.node_name = os.getenv("MESHCORE_NODE_NAME", "wf-alm-mc-node")
+        prefs.frequency_hz = DEFAULT_RADIO["frequency_hz"]
+        prefs.bandwidth_hz = DEFAULT_RADIO["bandwidth_hz"]
+        prefs.spreading_factor = DEFAULT_RADIO["spreading_factor"]
+        prefs.coding_rate = DEFAULT_RADIO["coding_rate"]
+        prefs.tx_power_dbm = DEFAULT_RADIO["tx_power_dbm"]
         for key, value in data.items():
             if hasattr(prefs, key):
                 setattr(prefs, key, value)
         if not data:
-            prefs.node_name = os.getenv("MESHCORE_NODE_NAME", "wf-alm-mc-node")
-            prefs.frequency_hz = DEFAULT_RADIO["frequency_hz"]
-            prefs.bandwidth_hz = DEFAULT_RADIO["bandwidth_hz"]
-            prefs.spreading_factor = DEFAULT_RADIO["spreading_factor"]
-            prefs.coding_rate = DEFAULT_RADIO["coding_rate"]
-            prefs.tx_power_dbm = DEFAULT_RADIO["tx_power_dbm"]
             self.save_prefs(prefs)
         return prefs
 
@@ -323,14 +348,8 @@ class PersistentCompanionRadio(CompanionRadio):
         self.state = state
         super().__init__(*args, initial_contacts=state.load_contacts(), **kwargs)
         prefs = state.load_prefs()
-        prefs.frequency_hz = DEFAULT_RADIO["frequency_hz"]
-        prefs.bandwidth_hz = DEFAULT_RADIO["bandwidth_hz"]
-        prefs.spreading_factor = DEFAULT_RADIO["spreading_factor"]
-        prefs.coding_rate = DEFAULT_RADIO["coding_rate"]
-        prefs.tx_power_dbm = DEFAULT_RADIO["tx_power_dbm"]
         self.prefs = prefs
-        self.node.node_name = prefs.node_name
-        self.node.radio_config = asdict(prefs)
+        self._sync_node_prefs()
         self._custom_vars = state.load_custom_vars()
         flood_scope = state.load_flood_scope()
         if flood_scope:
@@ -347,6 +366,21 @@ class PersistentCompanionRadio(CompanionRadio):
         if hasattr(self, "state"):
             self.state.save_prefs(self.prefs)
 
+    def _sync_node_prefs(self):
+        if hasattr(self, "node"):
+            self.node.node_name = self.prefs.node_name
+            self.node.radio_config = asdict(self.prefs)
+
+    def set_radio_params(self, freq_hz: int, bw_hz: int, sf: int, cr: int) -> bool:
+        ok = super().set_radio_params(freq_hz, bw_hz, sf, cr)
+        self._sync_node_prefs()
+        return ok
+
+    def set_tx_power(self, power_dbm: int) -> bool:
+        ok = super().set_tx_power(power_dbm)
+        self._sync_node_prefs()
+        return ok
+
     async def _apply_advert_to_stores(self, contact, *args, **kwargs):
         local_key = self.get_public_key()
         if contact.public_key == local_key:
@@ -359,8 +393,7 @@ class PersistentCompanionRadio(CompanionRadio):
 
     def set_advert_name(self, name: str) -> None:
         super().set_advert_name(name)
-        self.node.node_name = self.prefs.node_name
-        self.node.radio_config = asdict(self.prefs)
+        self._sync_node_prefs()
         logging.info("Advert name set to %r", self.prefs.node_name)
 
     def set_custom_var(self, name: str, value: str) -> bool:
@@ -435,13 +468,20 @@ class PersistentFrameServer(CompanionFrameServer):
         sf = data[8]
         cr = data[9]
         profile = (freq_khz * 1000, bw, sf, cr)
-        if profile not in ALLOWED_RADIO_PROFILES:
-            logging.warning("Rejected unsupported radio params: %s", profile)
-            self._write_ok()
+        if not (100_000 <= freq_khz <= 2_500_000):
+            logging.warning("Rejected invalid radio frequency: %s", profile)
+            self._write_err(ERR_CODE_BAD_STATE)
+            return
+        if not (7_000 <= bw <= 500_000):
+            logging.warning("Rejected invalid radio bandwidth: %s", profile)
+            self._write_err(ERR_CODE_BAD_STATE)
+            return
+        if not (5 <= sf <= 12) or not (5 <= cr <= 8):
+            logging.warning("Rejected invalid radio modulation: %s", profile)
+            self._write_err(ERR_CODE_BAD_STATE)
             return
         logging.info("Accepted radio params: %s", profile)
         ok = self.bridge.set_radio_params(*profile)
-        self.state.save_prefs(self.bridge.prefs)
         self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
 
     async def _cmd_set_tx_power(self, data: bytes) -> None:
@@ -449,9 +489,11 @@ class PersistentFrameServer(CompanionFrameServer):
         if len(data) < 1:
             self._write_err(ERR_CODE_BAD_STATE)
             return
-        power = max(2, min(20, struct.unpack_from("<b", data, 0)[0]))
+        power = struct.unpack_from("<b", data, 0)[0]
+        if power < -9 or power >= 30:
+            self._write_err(ERR_CODE_BAD_STATE)
+            return
         ok = self.bridge.set_tx_power(power)
-        self.state.save_prefs(self.bridge.prefs)
         self._write_ok() if ok else self._write_err(ERR_CODE_BAD_STATE)
 
     async def _cmd_set_flood_scope(self, data: bytes) -> None:
@@ -552,6 +594,7 @@ async def main():
     radio = create_radio()
     if not radio.begin():
         raise RuntimeError("LoRa radio initialization failed")
+    _apply_radio_prefs_to_device(radio, prefs)
 
     identity = load_identity()
     companion = PersistentCompanionRadio(
@@ -559,7 +602,7 @@ async def main():
         identity=identity,
         node_name=prefs.node_name,
         adv_type=ADV_TYPE_CHAT,
-        radio_config=DEFAULT_RADIO,
+        radio_config=_radio_config_from_prefs(prefs),
         state=state,
     )
     await companion.start()
